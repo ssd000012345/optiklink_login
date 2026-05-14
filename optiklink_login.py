@@ -217,16 +217,42 @@ def discord_authorize(oauth_params: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Step C: 回调
+# Step C: 回调（手动跟随重定向，打印跳转历史）
 # ─────────────────────────────────────────────────────────────
 def optiklink_callback(session: requests.Session, callback_url: str):
     url_log = re.sub(r'(code|token)=[^&]+', r'\1=***', callback_url)
     print(f"[C] 访问回调 URL（已脱敏）: {url_log[:100]} ...")
-    r = session.get(callback_url, timeout=15,
-                    headers=HEADERS_BROWSER, allow_redirects=True)
-    print(f"    状态码: {r.status_code}  最终URL: {r.url}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"回调失败，HTTP {r.status_code}")
+
+    current_url = callback_url
+    max_redirects = 10
+    history = []
+
+    for i in range(max_redirects):
+        resp = session.get(current_url, timeout=15,
+                           headers=HEADERS_BROWSER, allow_redirects=False)
+        history.append((resp.status_code, resp.url, resp.headers.get("Location", "")))
+        print(f"    跳转 #{i+1}: 状态码 {resp.status_code}, URL={resp.url[:80]}")
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            if not location:
+                raise RuntimeError(f"重定向无 Location 头: {resp.url}")
+            # 处理相对路径
+            if location.startswith("/"):
+                from urllib.parse import urljoin
+                location = urljoin(current_url, location)
+            current_url = location
+            continue
+        # 非重定向状态码：最终响应
+        final_resp = resp
+        break
+    else:
+        raise RuntimeError("重定向次数超过限制")
+
+    print(f"    最终状态码: {final_resp.status_code}  最终URL: {final_resp.url[:100]}")
+    if final_resp.status_code >= 400:
+        body_preview = final_resp.text[:200].replace("\n", " ")
+        print(f"    响应体预览（前200字符）: {body_preview}")
+        raise RuntimeError(f"回调失败，HTTP {final_resp.status_code}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -350,22 +376,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────────────────────────
-# 如何处理 client_id 变更（收到预警推送后操作）
-# ─────────────────────────────────────────────────────────────
-# 方法一（推荐）：更新 GitHub Secrets，无需改代码
-#   仓库 → Settings → Secrets and variables → Actions
-#   新增或编辑：DISCORD_CLIENT_ID = <新值>
-#               DISCORD_REDIRECT_URI = <新值（如有变化）>
-#
-# 方法二（兜底）：修改脚本默认值
-#   将 os.environ.get("DISCORD_CLIENT_ID", "旧值") 的旧值改为新值
-#
-# 如何抓取新 client_id：
-#   1. 浏览器打开 optiklink.net/auth（已退出登录）
-#   2. F12 → Network → 过滤 "discord"
-#   3. 点击页面 Discord 登录按钮
-#   4. 找到跳转 discord.com/oauth2/authorize 的请求
-#   5. 从 URL 中复制 client_id 和 redirect_uri
-# ─────────────────────────────────────────────────────────────
