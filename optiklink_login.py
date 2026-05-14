@@ -1,6 +1,10 @@
 """
-OptikLink 每日自动登录脚本 v2
+OptikLink 每日自动登录脚本 v3
 原理：用 Discord Token 完成 OAuth2 授权，拿到 session 后访问 Dashboard
+
+敏感信息处理规范：
+  - Token / UID 等凭证全部从环境变量读取，从不硬编码
+  - 日志输出中所有敏感值均经过 mask() 脱敏
 """
 
 import os
@@ -11,18 +15,21 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode
 
 # ─────────────────────────────────────────────────────────────
-# 配置区（全部从 GitHub Secrets 环境变量读取）
+# 配置区（全部从 GitHub Secrets / 环境变量读取，禁止明文硬编码）
 # ─────────────────────────────────────────────────────────────
 DISCORD_TOKEN  = os.environ["DISCORD_TOKEN"]    # Discord Token
 WXPUSHER_TOKEN = os.environ["WXPUSHER_TOKEN"]   # WxPusher appToken
 WXPUSHER_UID   = os.environ["WXPUSHER_UID"]     # WxPusher 接收者 UID
-EXPIRE_DATE    = "22.05.2026"                   # 服务到期日（兜底值）
 
-# ── OptikLink Discord OAuth2 固定参数 ──────────────────────────
-# 从浏览器 F12→Network 过滤 "discord.com/oauth2" 请求抓取
-# 若下面的值失效，按文末说明重新抓取
-DISCORD_CLIENT_ID    = "1005764586547838976"
-DISCORD_REDIRECT_URI = "https://optiklink.net/callback"
+# 服务到期日：优先从环境变量 EXPIRE_DATE 读取（格式 DD.MM.YYYY），
+# 否则使用下方兜底值（每次续期后更新此处 OR 在 Secrets 中维护）
+EXPIRE_DATE = os.environ.get("EXPIRE_DATE", "22.05.2026")
+
+# ── OptikLink Discord OAuth2 参数 ─────────────────────────────
+# 优先从 Secrets 环境变量读取，便于 client_id 变更后无需改代码
+# 若下面的值失效：按文末说明重新抓取后更新 GitHub Secrets
+DISCORD_CLIENT_ID    = os.environ.get("DISCORD_CLIENT_ID",    "1005764586547838976")
+DISCORD_REDIRECT_URI = os.environ.get("DISCORD_REDIRECT_URI", "https://optiklink.net/callback")
 
 # ─────────────────────────────────────────────────────────────
 HEADERS_BROWSER = {
@@ -35,6 +42,20 @@ HEADERS_BROWSER = {
 }
 
 
+# ─────────────────────────────────────────────────────────────
+# 脱敏工具：保留前4位 + *** + 后4位，长度不足时全部遮盖
+# ─────────────────────────────────────────────────────────────
+def mask(value: str, keep: int = 4) -> str:
+    if not value:
+        return "***"
+    if len(value) <= keep * 2:
+        return "***"
+    return value[:keep] + "***" + value[-keep:]
+
+
+# ─────────────────────────────────────────────────────────────
+# WxPusher 推送
+# ─────────────────────────────────────────────────────────────
 def wxpusher_send(title: str, content: str):
     resp = requests.post(
         "https://wxpusher.zjiecode.com/api/send/message",
@@ -48,18 +69,19 @@ def wxpusher_send(title: str, content: str):
         timeout=15,
     )
     result = resp.json()
-    print(f"[WxPusher] {result.get('msg')} | success={result.get('success')}")
+    print(f"[WxPusher] 推送至 uid={mask(WXPUSHER_UID)} | "
+          f"{result.get('msg')} | success={result.get('success')}")
 
 
 # ─────────────────────────────────────────────────────────────
-# Step A: 探测页面，尝试动态发现 OAuth 参数
+# Step A: 探测页面，动态发现 OAuth 参数；若发现新 client_id 则预警
 # ─────────────────────────────────────────────────────────────
 def discover_oauth_params(session: requests.Session) -> dict:
     params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
+        "client_id":     DISCORD_CLIENT_ID,
+        "redirect_uri":  DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds",
+        "scope":         "identify email guilds",
     }
 
     print("[A] 访问 /auth 探测页面结构 ...")
@@ -67,7 +89,11 @@ def discover_oauth_params(session: requests.Session) -> dict:
                     headers=HEADERS_BROWSER, allow_redirects=True)
 
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
-    print(f"    响应前 800 字符:\n{r.text[:800]}\n{'─'*40}")
+    # 不打印原始 HTML（可能含凭证相关信息），仅显示长度
+    print(f"    响应体长度: {len(r.text)} 字节")
+    print("─" * 40)
+
+    found_from_page = False
 
     # 尝试从 HTML/JS 中提取完整 discord oauth URL
     for pat in [
@@ -77,25 +103,52 @@ def discover_oauth_params(session: requests.Session) -> dict:
         m = re.search(pat, r.text)
         if m:
             raw_url = m.group(0).replace("&amp;", "&").rstrip("\\)\"'")
-            print(f"    发现 OAuth URL: {raw_url[:120]}")
+            print(f"    发现 OAuth URL（已截断）: {raw_url[:60]}...")
             parsed = urlparse(raw_url)
             qs = parse_qs(parsed.query)
             for key in ("client_id", "redirect_uri", "scope", "state"):
                 if qs.get(key):
                     params[key] = qs[key][0]
+            found_from_page = True
             break
-    else:
-        print("    未从页面找到 OAuth URL，使用硬编码参数")
 
     # 若页面直接跳转到了 discord.com，从最终 URL 解析
     if "discord.com" in r.url:
-        print(f"    页面直接跳转到 Discord: {r.url[:120]}")
+        print(f"    页面直接跳转到 Discord: {r.url[:60]}...")
         qs = parse_qs(urlparse(r.url).query)
         for key in ("client_id", "redirect_uri", "scope", "state"):
             if qs.get(key):
                 params[key] = qs[key][0]
+        found_from_page = True
 
-    print(f"    最终 OAuth 参数: {params}")
+    if not found_from_page:
+        print("    未从页面找到 OAuth URL，使用配置参数（环境变量/默认值）")
+
+    # 检测 client_id 是否与配置不符 → 预警
+    if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
+        new_cid = params["client_id"]
+        print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
+              f"页面新值={mask(new_cid, 6)}")
+        try:
+            wxpusher_send(
+                "⚠️ OptikLink client_id 已变更",
+                f"## client_id 已变更，请更新 Secrets\n\n"
+                f"| | 值（已脱敏）|\n|---|---|\n"
+                f"| 旧值 | `{mask(DISCORD_CLIENT_ID, 6)}` |\n"
+                f"| 新值 | `{mask(new_cid, 6)}` |\n\n"
+                f"**操作：** 前往 GitHub → Settings → Secrets，"
+                f"将 `DISCORD_CLIENT_ID` 更新为新值 `{new_cid}`\n\n"
+                f"时间：{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+            )
+        except Exception as pe:
+            print(f"    client_id 预警推送失败: {pe}")
+
+    # 日志中脱敏打印最终参数
+    safe_params = {
+        k: (mask(v, 6) if k in ("client_id",) else v)
+        for k, v in params.items()
+    }
+    print(f"    最终 OAuth 参数（已脱敏）: {safe_params}")
     return params
 
 
@@ -115,7 +168,7 @@ def discord_authorize(oauth_params: dict) -> str:
         params=post_params,
         json={"authorize": True, "permissions": "0"},
         headers={
-            "Authorization": DISCORD_TOKEN,
+            "Authorization": DISCORD_TOKEN,   # Token 本身不打印
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://discord.com/oauth2/authorize?" + urlencode(post_params),
@@ -131,7 +184,13 @@ def discord_authorize(oauth_params: dict) -> str:
         data = r.json()
     except Exception:
         data = {}
-    print(f"    Discord body: {str(data)[:300]}")
+
+    # 脱敏打印：去除 location 中可能携带的 code/token 参数
+    safe_data = dict(data)
+    if "location" in safe_data:
+        loc_masked = re.sub(r'(code|token|access_token)=[^&]+', r'\1=***', safe_data["location"])
+        safe_data["location"] = loc_masked
+    print(f"    Discord body（已脱敏）: {str(safe_data)[:300]}")
 
     if r.status_code == 200 and "location" in data:
         return data["location"]
@@ -139,11 +198,12 @@ def discord_authorize(oauth_params: dict) -> str:
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("Location", "")
         if loc:
-            print(f"    重定向 Location: {loc[:100]}")
+            loc_log = re.sub(r'(code|token|access_token)=[^&]+', r'\1=***', loc)
+            print(f"    重定向 Location（已脱敏）: {loc_log[:100]}")
             return loc
 
     raise RuntimeError(
-        f"Discord 授权失败 (HTTP {r.status_code}): {data}\n"
+        f"Discord 授权失败 (HTTP {r.status_code})\n"
         "可能原因：①Token 失效或格式错误 ②账号被限制 ③client_id/redirect_uri 不匹配"
     )
 
@@ -152,7 +212,8 @@ def discord_authorize(oauth_params: dict) -> str:
 # Step C: 回调
 # ─────────────────────────────────────────────────────────────
 def optiklink_callback(session: requests.Session, callback_url: str):
-    print(f"[C] 访问回调 URL: {callback_url[:100]} ...")
+    url_log = re.sub(r'(code|token)=[^&]+', r'\1=***', callback_url)
+    print(f"[C] 访问回调 URL（已脱敏）: {url_log[:100]} ...")
     r = session.get(callback_url, timeout=15,
                     headers=HEADERS_BROWSER, allow_redirects=True)
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
@@ -178,7 +239,7 @@ def check_dashboard(session: requests.Session) -> dict:
         for pat in [
             r'Welcome\s+<[^>]+>([^<]+)</[^>]+>\s+to your Dashboard',
             r'"username"\s*:\s*"([^"]+)"',
-            r'simeter\w*',          # 你的用户名前缀，可按实际修改
+            r'simeter\w*',
         ]:
             m = re.search(pat, html, re.I)
             if m:
@@ -196,20 +257,33 @@ def check_dashboard(session: requests.Session) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# 推送消息
+# 推送消息（含分级到期提醒）
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
-    today = datetime.now()
+    today = datetime.utcnow()
     expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y")
     days_left = (expire_dt - today).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
-    warning = ""
-    if days_left <= 7:
-        warning = f"\n\n> ⚠️ **服务即将到期！还剩 {days_left} 天，请立即续期！**"
-    elif days_left <= 30:
-        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天"
 
-    title = f"OptikLink 签到 | {status}"
+    # 分级到期提醒
+    if days_left <= 3:
+        warning = (
+            f"\n\n---\n"
+            f"## 🚨🚨🚨 紧急：服务即将到期！\n\n"
+            f"> **距到期仅剩 {days_left} 天，请立即续期，否则服务将中断！**"
+        )
+        title = f"🚨 OptikLink 签到 | 紧急：{days_left}天后到期！"
+    elif days_left <= 7:
+        warning = (
+            f"\n\n---\n"
+            f"## ⚠️ 警告：服务即将到期\n\n"
+            f"> 距到期还剩 **{days_left}** 天，请尽快安排续期。"
+        )
+        title = f"⚠️ OptikLink 签到 | 警告：{days_left}天后到期"
+    else:
+        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if days_left <= 30 else ""
+        title = f"OptikLink 签到 | {status}"
+
     content = f"""## OptikLink 每日自动登录报告
 
 | 项目 | 内容 |
@@ -230,8 +304,17 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("  OptikLink 自动登录脚本  v2")
+    print("  OptikLink 自动登录脚本  v3")
     print("=" * 55)
+    # 启动时打印脱敏的配置摘要（便于排查，不泄露敏感值）
+    print(f"  DISCORD_TOKEN      : {mask(DISCORD_TOKEN)}")
+    print(f"  WXPUSHER_TOKEN     : {mask(WXPUSHER_TOKEN)}")
+    print(f"  WXPUSHER_UID       : {mask(WXPUSHER_UID)}")
+    print(f"  DISCORD_CLIENT_ID  : {mask(DISCORD_CLIENT_ID, 6)}")
+    print(f"  DISCORD_REDIRECT_URI: {DISCORD_REDIRECT_URI}")
+    print(f"  EXPIRE_DATE        : {EXPIRE_DATE}")
+    print("=" * 55)
+
     session = requests.Session()
     try:
         oauth_params   = discover_oauth_params(session)
@@ -250,7 +333,7 @@ def main():
             wxpusher_send(
                 "OptikLink 签到 ❌ 失败",
                 f"## 执行失败\n\n**错误：**\n```\n{err_msg}\n```\n"
-                f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                f"时间：{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
             )
         except Exception as pe:
             print(f"WxPusher 推送失败: {pe}")
@@ -261,11 +344,20 @@ if __name__ == "__main__":
     main()
 
 # ─────────────────────────────────────────────────────────────
-# 如何重新抓取 client_id / redirect_uri（页面改版后使用）
+# 如何处理 client_id 变更（收到预警推送后操作）
 # ─────────────────────────────────────────────────────────────
-# 1. 浏览器打开 optiklink.net/auth（已退出登录状态）
-# 2. F12 → Network → 过滤 "discord"
-# 3. 点击页面上的 Discord 登录按钮
-# 4. 找到跳转到 discord.com/oauth2/authorize 的请求
-# 5. 复制完整 URL，从中提取 client_id 和 redirect_uri
-# 6. 更新脚本顶部 DISCORD_CLIENT_ID / DISCORD_REDIRECT_URI
+# 方法一（推荐）：更新 GitHub Secrets，无需改代码
+#   仓库 → Settings → Secrets and variables → Actions
+#   新增或编辑：DISCORD_CLIENT_ID = <新值>
+#               DISCORD_REDIRECT_URI = <新值（如有变化）>
+#
+# 方法二（兜底）：修改脚本默认值
+#   将 os.environ.get("DISCORD_CLIENT_ID", "旧值") 的旧值改为新值
+#
+# 如何抓取新 client_id：
+#   1. 浏览器打开 optiklink.net/auth（已退出登录）
+#   2. F12 → Network → 过滤 "discord"
+#   3. 点击页面 Discord 登录按钮
+#   4. 找到跳转 discord.com/oauth2/authorize 的请求
+#   5. 从 URL 中复制 client_id 和 redirect_uri
+# ─────────────────────────────────────────────────────────────
