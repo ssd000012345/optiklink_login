@@ -10,9 +10,18 @@ OptikLink 每日自动登录脚本 v3
 import os
 import re
 import sys
-import requests
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode
+
+# 优先使用 cloudscraper 绕过 Cloudflare 验证
+try:
+    import cloudscraper
+    USE_CLOUDSCRAPER = True
+    print("[信息] 使用 cloudscraper 绕过 Cloudflare 人机验证")
+except ImportError:
+    import requests
+    USE_CLOUDSCRAPER = False
+    print("[警告] cloudscraper 未安装，将使用普通 requests，可能无法绕过 Cloudflare 验证")
 
 # ─────────────────────────────────────────────────────────────
 # 配置区（全部从 GitHub Secrets / 环境变量读取，禁止明文硬编码）
@@ -57,6 +66,9 @@ def mask(value: str, keep: int = 4) -> str:
 # WxPusher 推送
 # ─────────────────────────────────────────────────────────────
 def wxpusher_send(title: str, content: str):
+    # 推送时也使用 cloudscraper 创建的会话（全局 session 在 main 中传递）
+    # 但这里为了方便，单独用 requests 也可（WxPusher 没有 Cloudflare）
+    import requests
     resp = requests.post(
         "https://wxpusher.zjiecode.com/api/send/message",
         json={
@@ -76,7 +88,7 @@ def wxpusher_send(title: str, content: str):
 # ─────────────────────────────────────────────────────────────
 # Step A: 探测页面，动态发现 OAuth 参数；若发现新 client_id 则预警
 # ─────────────────────────────────────────────────────────────
-def discover_oauth_params(session: requests.Session) -> dict:
+def discover_oauth_params(session) -> dict:
     params = {
         "client_id":     DISCORD_CLIENT_ID,
         "redirect_uri":  DISCORD_REDIRECT_URI,
@@ -89,7 +101,6 @@ def discover_oauth_params(session: requests.Session) -> dict:
                     headers=HEADERS_BROWSER, allow_redirects=True)
 
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
-    # 不打印原始 HTML（可能含凭证相关信息），仅显示长度
     print(f"    响应体长度: {len(r.text)} 字节")
     print("─" * 40)
 
@@ -124,14 +135,13 @@ def discover_oauth_params(session: requests.Session) -> dict:
     if not found_from_page:
         print("    未从页面找到 OAuth URL，使用配置参数（环境变量/默认值）")
 
-    # 检测 client_id 是否与配置不符 → 自动用新值，并写入输出供 workflow 更新 Secret
+    # 检测 client_id 是否与配置不符
     if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
         new_cid = params["client_id"]
         print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
               f"页面新值={mask(new_cid, 6)}")
         print(f"    ✅  已自动切换为新 client_id，本次直接使用新值继续执行")
 
-        # 写入 GitHub Actions 输出文件，供后续 workflow 步骤自动更新 Secret
         github_output = os.environ.get("GITHUB_OUTPUT", "")
         if github_output:
             with open(github_output, "a") as f:
@@ -151,7 +161,6 @@ def discover_oauth_params(session: requests.Session) -> dict:
         except Exception as pe:
             print(f"    client_id 预警推送失败: {pe}")
 
-    # 日志中脱敏打印最终参数
     safe_params = {
         k: (mask(v, 6) if k in ("client_id",) else v)
         for k, v in params.items()
@@ -171,12 +180,14 @@ def discord_authorize(oauth_params: dict) -> str:
     if "state" in oauth_params:
         post_params["state"] = oauth_params["state"]
 
+    # Discord API 不需要绕过 Cloudflare，直接用 requests 即可
+    import requests
     r = requests.post(
         "https://discord.com/api/v10/oauth2/authorize",
         params=post_params,
         json={"authorize": True, "permissions": "0"},
         headers={
-            "Authorization": DISCORD_TOKEN,   # Token 本身不打印
+            "Authorization": DISCORD_TOKEN,
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://discord.com/oauth2/authorize?" + urlencode(post_params),
@@ -193,7 +204,6 @@ def discord_authorize(oauth_params: dict) -> str:
     except Exception:
         data = {}
 
-    # 脱敏打印：去除 location 中可能携带的 code/token 参数
     safe_data = dict(data)
     if "location" in safe_data:
         loc_masked = re.sub(r'(code|token|access_token)=[^&]+', r'\1=***', safe_data["location"])
@@ -217,26 +227,24 @@ def discord_authorize(oauth_params: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Step C: 回调（手动跟随重定向，打印跳转历史）
+# Step C: 回调（使用 cloudscraper 会话自动绕过 Cloudflare）
 # ─────────────────────────────────────────────────────────────
-def optiklink_callback(session: requests.Session, callback_url: str):
+def optiklink_callback(session, callback_url: str):
     url_log = re.sub(r'(code|token)=[^&]+', r'\1=***', callback_url)
     print(f"[C] 访问回调 URL（已脱敏）: {url_log[:100]} ...")
 
+    # 手动跟随重定向，逐跳打印（保留调试信息）
     current_url = callback_url
     max_redirects = 10
-    history = []
 
     for i in range(max_redirects):
         resp = session.get(current_url, timeout=15,
                            headers=HEADERS_BROWSER, allow_redirects=False)
-        history.append((resp.status_code, resp.url, resp.headers.get("Location", "")))
         print(f"    跳转 #{i+1}: 状态码 {resp.status_code}, URL={resp.url[:80]}")
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location")
             if not location:
                 raise RuntimeError(f"重定向无 Location 头: {resp.url}")
-            # 处理相对路径
             if location.startswith("/"):
                 from urllib.parse import urljoin
                 location = urljoin(current_url, location)
@@ -258,7 +266,7 @@ def optiklink_callback(session: requests.Session, callback_url: str):
 # ─────────────────────────────────────────────────────────────
 # Step D: Dashboard
 # ─────────────────────────────────────────────────────────────
-def check_dashboard(session: requests.Session) -> dict:
+def check_dashboard(session) -> dict:
     print("[D] 访问 Dashboard ...")
     r = session.get("https://optiklink.net", timeout=15,
                     headers=HEADERS_BROWSER, allow_redirects=True)
@@ -299,7 +307,6 @@ def build_message(info: dict) -> tuple[str, str]:
     days_left = (expire_dt - today).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
 
-    # 分级到期提醒
     if days_left <= 3:
         warning = (
             f"\n\n---\n"
@@ -340,7 +347,6 @@ def main():
     print("=" * 55)
     print("  OptikLink 自动登录脚本  v3")
     print("=" * 55)
-    # 启动时打印脱敏的配置摘要（便于排查，不泄露敏感值）
     print(f"  DISCORD_TOKEN      : {mask(DISCORD_TOKEN)}")
     print(f"  WXPUSHER_TOKEN     : {mask(WXPUSHER_TOKEN)}")
     print(f"  WXPUSHER_UID       : {mask(WXPUSHER_UID)}")
@@ -349,7 +355,14 @@ def main():
     print(f"  EXPIRE_DATE        : {EXPIRE_DATE}")
     print("=" * 55)
 
-    session = requests.Session()
+    # 创建会话：优先使用 cloudscraper，否则回退到 requests.Session
+    if USE_CLOUDSCRAPER:
+        session = cloudscraper.create_scraper()
+    else:
+        import requests
+        session = requests.Session()
+        print("[警告] 使用普通 requests.Session，可能无法绕过 Cloudflare 验证")
+
     try:
         oauth_params   = discover_oauth_params(session)
         callback_url   = discord_authorize(oauth_params)
