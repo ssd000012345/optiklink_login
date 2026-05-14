@@ -124,20 +124,28 @@ def discover_oauth_params(session: requests.Session) -> dict:
     if not found_from_page:
         print("    未从页面找到 OAuth URL，使用配置参数（环境变量/默认值）")
 
-    # 检测 client_id 是否与配置不符 → 预警
+    # 检测 client_id 是否与配置不符 → 自动用新值，并写入输出供 workflow 更新 Secret
     if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
         new_cid = params["client_id"]
         print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
               f"页面新值={mask(new_cid, 6)}")
+        print(f"    ✅  已自动切换为新 client_id，本次直接使用新值继续执行")
+
+        # 写入 GitHub Actions 输出文件，供后续 workflow 步骤自动更新 Secret
+        github_output = os.environ.get("GITHUB_OUTPUT", "")
+        if github_output:
+            with open(github_output, "a") as f:
+                f.write(f"new_client_id={new_cid}\n")
+            print(f"    📝  已写入 GITHUB_OUTPUT，workflow 将自动更新 Secret")
+
         try:
             wxpusher_send(
-                "⚠️ OptikLink client_id 已变更",
-                f"## client_id 已变更，请更新 Secrets\n\n"
+                "⚠️ OptikLink client_id 已变更（已自动处理）",
+                f"## client_id 已变更\n\n"
                 f"| | 值（已脱敏）|\n|---|---|\n"
                 f"| 旧值 | `{mask(DISCORD_CLIENT_ID, 6)}` |\n"
                 f"| 新值 | `{mask(new_cid, 6)}` |\n\n"
-                f"**操作：** 前往 GitHub → Settings → Secrets，"
-                f"将 `DISCORD_CLIENT_ID` 更新为新值 `{new_cid}`\n\n"
+                f"✅ **本次已自动切换为新值执行，Secret 也将自动更新，无需手动操作。**\n\n"
                 f"时间：{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
             )
         except Exception as pe:
