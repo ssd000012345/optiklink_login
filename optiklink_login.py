@@ -66,8 +66,6 @@ def mask(value: str, keep: int = 4) -> str:
 # WxPusher 推送
 # ─────────────────────────────────────────────────────────────
 def wxpusher_send(title: str, content: str):
-    # 推送时也使用 cloudscraper 创建的会话（全局 session 在 main 中传递）
-    # 但这里为了方便，单独用 requests 也可（WxPusher 没有 Cloudflare）
     import requests
     resp = requests.post(
         "https://wxpusher.zjiecode.com/api/send/message",
@@ -106,7 +104,6 @@ def discover_oauth_params(session) -> dict:
 
     found_from_page = False
 
-    # 尝试从 HTML/JS 中提取完整 discord oauth URL
     for pat in [
         r'https?://discord\.com(?:/api)?/oauth2/authorize[^\s\'"<>\\]+',
         r'https?://discord\.com/oauth2/authorize[^\s\'"<>\\]+',
@@ -123,7 +120,6 @@ def discover_oauth_params(session) -> dict:
             found_from_page = True
             break
 
-    # 若页面直接跳转到了 discord.com，从最终 URL 解析
     if "discord.com" in r.url:
         print(f"    页面直接跳转到 Discord: {r.url[:60]}...")
         qs = parse_qs(urlparse(r.url).query)
@@ -135,7 +131,6 @@ def discover_oauth_params(session) -> dict:
     if not found_from_page:
         print("    未从页面找到 OAuth URL，使用配置参数（环境变量/默认值）")
 
-    # 检测 client_id 是否与配置不符
     if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
         new_cid = params["client_id"]
         print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
@@ -161,7 +156,6 @@ def discover_oauth_params(session) -> dict:
         except Exception as pe:
             print(f"    client_id 预警推送失败: {pe}")
 
-    # 日志中脱敏打印最终参数（对 client_id 和 redirect_uri 都做脱敏）
     safe_params = {
         k: (mask(v, 6) if k in ("client_id", "redirect_uri") else v)
         for k, v in params.items()
@@ -181,7 +175,6 @@ def discord_authorize(oauth_params: dict) -> str:
     if "state" in oauth_params:
         post_params["state"] = oauth_params["state"]
 
-    # Discord API 不需要绕过 Cloudflare，直接用 requests 即可
     import requests
     r = requests.post(
         "https://discord.com/api/v10/oauth2/authorize",
@@ -234,7 +227,6 @@ def optiklink_callback(session, callback_url: str):
     url_log = re.sub(r'(code|token)=[^&]+', r'\1=***', callback_url)
     print(f"[C] 访问回调 URL（已脱敏）: {url_log[:100]} ...")
 
-    # 手动跟随重定向，逐跳打印（保留调试信息）
     current_url = callback_url
     max_redirects = 10
 
@@ -251,7 +243,6 @@ def optiklink_callback(session, callback_url: str):
                 location = urljoin(current_url, location)
             current_url = location
             continue
-        # 非重定向状态码：最终响应
         final_resp = resp
         break
     else:
@@ -304,7 +295,6 @@ def check_dashboard(session) -> dict:
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
-    # 将 expire_date 也设置为带时区的 datetime 对象，避免 naive/aware 混用
     expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
     days_left = (expire_dt - now_utc).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
@@ -353,11 +343,13 @@ def main():
     print(f"  WXPUSHER_TOKEN     : {mask(WXPUSHER_TOKEN)}")
     print(f"  WXPUSHER_UID       : {mask(WXPUSHER_UID)}")
     print(f"  DISCORD_CLIENT_ID  : {mask(DISCORD_CLIENT_ID, 6)}")
-    print(f"  DISCORD_REDIRECT_URI: {mask(DISCORD_REDIRECT_URI)}")
-    print(f"  EXPIRE_DATE        : {EXPIRE_DATE}")
+    # 完全隐藏 redirect_uri，不显示任何真实字符
+    print(f"  DISCORD_REDIRECT_URI: ***")
+    # 如果 EXPIRE_DATE 为空，显示“未设置”
+    expire_display = EXPIRE_DATE if EXPIRE_DATE else "未设置"
+    print(f"  EXPIRE_DATE        : {expire_display}")
     print("=" * 55)
 
-    # 创建会话：优先使用 cloudscraper，否则回退到 requests.Session
     if USE_CLOUDSCRAPER:
         session = cloudscraper.create_scraper()
     else:
