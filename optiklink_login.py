@@ -304,7 +304,8 @@ def check_dashboard(session) -> dict:
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
-    expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y")
+    # 将 expire_date 也设置为带时区的 datetime 对象，避免 naive/aware 混用
+    expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
     days_left = (expire_dt - now_utc).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
 
