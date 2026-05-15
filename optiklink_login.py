@@ -79,7 +79,7 @@ def wxpusher_send(title: str, content: str):
         timeout=15,
     )
     result = resp.json()
-    print(f"  WXPUSHER_UID       : ***")
+    print(f"[WxPusher] 推送至 uid={mask(WXPUSHER_UID)} | "
           f"{result.get('msg')} | success={result.get('success')}")
 
 
@@ -133,7 +133,7 @@ def discover_oauth_params(session) -> dict:
 
     if params.get("client_id") and params["client_id"] != DISCORD_CLIENT_ID:
         new_cid = params["client_id"]
-    print(f"  DISCORD_CLIENT_ID  : ***")
+        print(f"    ⚠️  页面 client_id 已变更！配置值={mask(DISCORD_CLIENT_ID, 6)}  "
               f"页面新值={mask(new_cid, 6)}")
         print(f"    ✅  已自动切换为新 client_id，本次直接使用新值继续执行")
 
@@ -148,7 +148,7 @@ def discover_oauth_params(session) -> dict:
                 "⚠️ OptikLink client_id 已变更（已自动处理）",
                 f"## client_id 已变更\n\n"
                 f"| | 值（已脱敏）|\n|---|---|\n"
-    print(f"  DISCORD_CLIENT_ID  : ***")
+                f"| 旧值 | `{mask(DISCORD_CLIENT_ID, 6)}` |\n"
                 f"| 新值 | `{mask(new_cid, 6)}` |\n\n"
                 f"✅ **本次已自动切换为新值执行，Secret 也将自动更新，无需手动操作。**\n\n"
                 f"时间：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -346,7 +346,9 @@ def main():
     print(f"  WXPUSHER_TOKEN     : ***")
     print(f"  WXPUSHER_UID       : ***")
     print(f"  DISCORD_CLIENT_ID  : ***")
+    # 完全隐藏 redirect_uri，不显示任何真实字符
     print(f"  DISCORD_REDIRECT_URI: ***")
+    # 如果 EXPIRE_DATE 为空，显示“未设置”
     print(f"  EXPIRE_DATE        : ***")
     print("=" * 55)
 
