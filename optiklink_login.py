@@ -256,13 +256,6 @@ def optiklink_callback(session, callback_url: str):
         body_preview = final_resp.text[:200].replace("\n", " ")
         print(f"    响应体预览（前200字符）: {body_preview}")
         raise RuntimeError(f"回调失败，HTTP {final_resp.status_code}")
-    # 检测是否被 VPN 拦截（即使状态码是 200 也可能落在 /error/vpn）
-    if "error/vpn" in final_resp.url.lower():
-        raise RuntimeError(
-            "❌ 被服务器识别为 VPN/数据中心 IP，登录被拦截（/error/vpn）\n"
-            "原因：GitHub Actions IP 被 OptikLink 列入黑名单\n"
-            "建议：更换运行环境（家庭服务器/住宅代理），或等待下次 Actions IP 轮换后重试"
-        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -275,7 +268,7 @@ def check_dashboard(session) -> dict:
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
 
     info = {"logged_in": False, "username": "N/A",
-            "expire_date": "", "running_servers": "N/A"}
+            "expire_date": EXPIRE_DATE, "running_servers": "N/A"}
     html = r.text
 
     if "DASHBOARD" in html.upper():
@@ -305,48 +298,26 @@ def check_dashboard(session) -> dict:
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
+    expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
+    days_left = (expire_dt - now_utc).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
 
-    expire_raw = info.get("expire_date", "")
-    if expire_raw:
-        try:
-            expire_dt = datetime.strptime(expire_raw, "%d.%m.%Y").replace(tzinfo=timezone.utc)
-            days_left = (expire_dt - now_utc).days
-            expire_str = expire_raw
-            days_str = f"{days_left} 天"
-        except ValueError:
-            expire_dt = None
-            days_left = None
-            expire_str = expire_raw
-            days_str = "解析失败"
-    else:
-        expire_dt = None
-        days_left = None
-        expire_str = "未获取到"
-        days_str = "未知"
-
-    if days_left is not None and days_left <= 3:
+    if days_left <= 3:
         warning = (
             f"\n\n---\n"
             f"## 🚨🚨🚨 紧急：服务即将到期！\n\n"
             f"> **距到期仅剩 {days_left} 天，请立即续期，否则服务将中断！**"
         )
         title = f"🚨 OptikLink 签到 | 紧急：{days_left}天后到期！"
-    elif days_left is not None and days_left <= 7:
+    elif days_left <= 7:
         warning = (
             f"\n\n---\n"
             f"## ⚠️ 警告：服务即将到期\n\n"
             f"> 距到期还剩 **{days_left}** 天，请尽快安排续期。"
         )
         title = f"⚠️ OptikLink 签到 | 警告：{days_left}天后到期"
-    elif days_left is not None and days_left <= 30:
-        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天"
-        title = f"OptikLink 签到 | {status}"
-    elif days_left is None:
-        warning = f"\n\n> ⚠️ 未能获取到期日期，请手动确认服务状态"
-        title = f"OptikLink 签到 | {status} | ⚠️ 到期日未知"
     else:
-        warning = ""
+        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if days_left <= 30 else ""
         title = f"OptikLink 签到 | {status}"
 
     content = f"""## OptikLink 每日自动登录报告
@@ -356,8 +327,8 @@ def build_message(info: dict) -> tuple[str, str]:
 | 状态 | {status} |
 | 用户名 | {info['username']} |
 | 运行服务器 | {info['running_servers']} 个 |
-| 服务到期 | {expire_str} |
-| 剩余天数 | {days_str} |
+| 服务到期 | {info['expire_date']} |
+| 剩余天数 | {days_left} 天 |
 | 执行时间 | {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC |
 {warning}
 """
@@ -387,6 +358,14 @@ def main():
         import requests
         session = requests.Session()
         print("[警告] 使用普通 requests.Session，可能无法绕过 Cloudflare 验证")
+
+    # 如果配置了 V2Ray SOCKS5 代理，让 session 走代理出去
+    proxy_url = os.environ.get("PROXY_URL", "")
+    if proxy_url:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        print(f"[信息] 已启用代理: {proxy_url}")
+    else:
+        print("[信息] 未配置代理，直连出口")
 
     try:
         oauth_params   = discover_oauth_params(session)
