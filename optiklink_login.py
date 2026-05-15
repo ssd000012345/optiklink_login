@@ -298,26 +298,48 @@ def check_dashboard(session) -> dict:
 # ─────────────────────────────────────────────────────────────
 def build_message(info: dict) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
-    expire_dt = datetime.strptime(info["expire_date"], "%d.%m.%Y").replace(tzinfo=timezone.utc)
-    days_left = (expire_dt - now_utc).days
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
 
-    if days_left <= 3:
+    expire_raw = info.get("expire_date", "")
+    if expire_raw:
+        try:
+            expire_dt = datetime.strptime(expire_raw, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            days_left = (expire_dt - now_utc).days
+            expire_str = expire_raw
+            days_str = f"{days_left} 天"
+        except ValueError:
+            expire_dt = None
+            days_left = None
+            expire_str = expire_raw
+            days_str = "解析失败"
+    else:
+        expire_dt = None
+        days_left = None
+        expire_str = "未获取到"
+        days_str = "未知"
+
+    if days_left is not None and days_left <= 3:
         warning = (
             f"\n\n---\n"
             f"## 🚨🚨🚨 紧急：服务即将到期！\n\n"
             f"> **距到期仅剩 {days_left} 天，请立即续期，否则服务将中断！**"
         )
         title = f"🚨 OptikLink 签到 | 紧急：{days_left}天后到期！"
-    elif days_left <= 7:
+    elif days_left is not None and days_left <= 7:
         warning = (
             f"\n\n---\n"
             f"## ⚠️ 警告：服务即将到期\n\n"
             f"> 距到期还剩 **{days_left}** 天，请尽快安排续期。"
         )
         title = f"⚠️ OptikLink 签到 | 警告：{days_left}天后到期"
+    elif days_left is not None and days_left <= 30:
+        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天"
+        title = f"OptikLink 签到 | {status}"
+    elif days_left is None:
+        warning = f"\n\n> ⚠️ 未能获取到期日期，请手动确认服务状态"
+        title = f"OptikLink 签到 | {status} | ⚠️ 到期日未知"
     else:
-        warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if days_left <= 30 else ""
+        warning = ""
         title = f"OptikLink 签到 | {status}"
 
     content = f"""## OptikLink 每日自动登录报告
@@ -327,8 +349,8 @@ def build_message(info: dict) -> tuple[str, str]:
 | 状态 | {status} |
 | 用户名 | {info['username']} |
 | 运行服务器 | {info['running_servers']} 个 |
-| 服务到期 | {info['expire_date']} |
-| 剩余天数 | {days_left} 天 |
+| 服务到期 | {expire_str} |
+| 剩余天数 | {days_str} |
 | 执行时间 | {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC |
 {warning}
 """
