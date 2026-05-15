@@ -256,6 +256,13 @@ def optiklink_callback(session, callback_url: str):
         body_preview = final_resp.text[:200].replace("\n", " ")
         print(f"    响应体预览（前200字符）: {body_preview}")
         raise RuntimeError(f"回调失败，HTTP {final_resp.status_code}")
+    # 检测是否被 VPN 拦截（即使状态码是 200 也可能落在 /error/vpn）
+    if "error/vpn" in final_resp.url.lower():
+        raise RuntimeError(
+            "❌ 被服务器识别为 VPN/数据中心 IP，登录被拦截（/error/vpn）\n"
+            "原因：GitHub Actions IP 被 OptikLink 列入黑名单\n"
+            "建议：更换运行环境（家庭服务器/住宅代理），或等待下次 Actions IP 轮换后重试"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -268,7 +275,7 @@ def check_dashboard(session) -> dict:
     print(f"    状态码: {r.status_code}  最终URL: {r.url}")
 
     info = {"logged_in": False, "username": "N/A",
-            "expire_date": EXPIRE_DATE, "running_servers": "N/A"}
+            "expire_date": "", "running_servers": "N/A"}
     html = r.text
 
     if "DASHBOARD" in html.upper():
